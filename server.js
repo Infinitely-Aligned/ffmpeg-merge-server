@@ -1,53 +1,68 @@
-const express = require("express");
-const multer = require("multer");
-const ffmpeg = require("fluent-ffmpeg");
-const fs = require("fs");
-const path = require("path");
+const express = require('express');
+const fetch = require('node-fetch');
+const ffmpeg = require('fluent-ffmpeg');
+const fs = require('fs');
+const path = require('path');
+const cors = require('cors');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const upload = multer({ dest: "uploads/" });
+const PORT = process.env.PORT || 3000;
 
+app.use(cors());
 app.use(express.json());
 
-app.post("/", upload.none(), async (req, res) => {
-  const { voice_url, bg_url, volume = 0.4 } = req.body;
+app.post('/merge', async (req, res) => {
+  const { voice_url, bg_url, volume } = req.body;
 
-  const voicePath = `downloads/voice.mp3`;
-  const bgPath = `downloads/bg.mp3`;
-  const outputPath = `merged/merged_${Date.now()}.mp3`;
+  if (!voice_url || !bg_url || typeof volume !== 'number') {
+    return res.status(400).send('Missing required fields.');
+  }
 
-  const download = (url, dest) =>
-    new Promise((resolve, reject) => {
-      const file = fs.createWriteStream(dest);
-      require("https").get(url, (response) => {
-        response.pipe(file);
-        file.on("finish", () => file.close(resolve));
-      }).on("error", reject);
-    });
+  const voicePath = path.join(__dirname, `${uuidv4()}-voice.mp3`);
+  const bgPath = path.join(__dirname, `${uuidv4()}-bg.mp3`);
+  const outputPath = path.join(__dirname, `${uuidv4()}-merged.mp3`);
 
   try {
-    fs.mkdirSync("downloads", { recursive: true });
-    fs.mkdirSync("merged", { recursive: true });
+    const downloadFile = async (url, dest) => {
+      const res = await fetch(url);
+      const fileStream = fs.createWriteStream(dest);
+      await new Promise((resolve, reject) => {
+        res.body.pipe(fileStream);
+        res.body.on('error', reject);
+        fileStream.on('finish', resolve);
+      });
+    };
 
-    await download(voice_url, voicePath);
-    await download(bg_url, bgPath);
+    await downloadFile(voice_url, voicePath);
+    await downloadFile(bg_url, bgPath);
 
-    ffmpeg()
-      .input(voicePath)
-      .input(bgPath)
-      .complexFilter([`[1:a]volume=${volume}[bg]`, `[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0`])
-      .on("end", () => {
-        res.sendFile(path.resolve(outputPath));
-      })
-      .on("error", (err) => {
-        console.error("FFmpeg error:", err);
-        res.status(500).send("Merging failed");
-      })
-      .save(outputPath);
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(voicePath)
+        .input(bgPath)
+        .complexFilter([
+          `[1:a]volume=${volume}[bg]; [0:a][bg]amix=inputs=2:duration=first:dropout_transition=2`,
+        ])
+        .outputOptions('-c:a libmp3lame')
+        .save(outputPath)
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    const mergedBuffer = fs.readFileSync(outputPath);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.send(mergedBuffer);
   } catch (err) {
-    console.error("Download or processing error:", err);
-    res.status(500).send("Internal Server Error");
+    console.error('Error during merge:', err);
+    res.status(500).send('Failed to merge audio.');
+  } finally {
+    [voicePath, bgPath, outputPath].forEach((file) => {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    });
   }
 });
 
-app.listen(3000, () => console.log("FFmpeg merge server running on port 3000"));
+app.listen(PORT, () => {
+  console.log(`Merge server listening on port ${PORT}`);
+});
